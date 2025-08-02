@@ -10,18 +10,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from config import TELEGRAM_TOKEN, GOOGLE_SHEET_ID, SHEET_NAME, OPENAI_API_KEY
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
-import threading
-import calendar
 
 # Московское время
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
-
-# Инициализация scheduler
-scheduler = BackgroundScheduler()
-scheduler.start()
 
 def get_moscow_time():
     """Возвращает текущее московское время"""
@@ -71,6 +62,7 @@ try:
     logger.info("Google Sheets подключение успешно установлено")
 except Exception as e:
     logger.error(f"Ошибка подключения к Google Sheets: {e}")
+    logger.warning("Бот будет работать в режиме демонстрации без Google Sheets")
     # Создаем заглушку для тестирования
     finance_sheet = None
 
@@ -1138,8 +1130,9 @@ def matches_filters(record, filters):
     # Текстовый поиск
     if filters['text']:
         text_to_search = f"{record.get('Описание/Получатель', '')} {record.get('Категория', '')}".lower()
+        # Проверяем, что ВСЕ текстовые фильтры присутствуют в записи
         for text_filter in filters['text']:
-            if text_filter not in text_to_search:
+            if text_filter.lower() not in text_to_search:
                 return False
 
     # Фильтр по категориям
@@ -1676,10 +1669,6 @@ def main():
 
     # Запускаем приложение
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-    # --- В main(): graceful shutdown для scheduler ---
-    import atexit
-    atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
     main()
