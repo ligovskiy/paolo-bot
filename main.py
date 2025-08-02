@@ -37,10 +37,17 @@ logger = logging.getLogger(__name__)
 # Настройка OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Настройка Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-gc = gspread.authorize(creds)
+import json
+import os
+
+# Читаем credentials из переменной окружения
+creds_json = os.getenv('GOOGLE_CREDENTIALS')
+if creds_json:
+    creds_info = json.loads(creds_json)
+    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+else:
+    # Fallback на файл для локальной разработки
+    creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
 
 # Открываем таблицы
 finance_sheet = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_NAME)
