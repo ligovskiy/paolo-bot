@@ -19,6 +19,10 @@ import calendar
 # Московское время
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
+# Инициализация scheduler
+scheduler = BackgroundScheduler()
+scheduler.start()
+
 def get_moscow_time():
     """Возвращает текущее московское время"""
     return datetime.now(MOSCOW_TZ)
@@ -39,11 +43,36 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Настройка Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-gc = gspread.authorize(creds)
 
-# Открываем таблицы
-finance_sheet = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_NAME)
+# Получаем credentials из переменной окружения или файла
+def get_google_credentials():
+    """Получает Google credentials из переменной окружения или файла"""
+    # Сначала пробуем из переменной окружения (для Render)
+    google_creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+    if google_creds_json:
+        try:
+            creds_dict = json.loads(google_creds_json)
+            return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        except Exception as e:
+            logger.error(f"Ошибка парсинга GOOGLE_CREDENTIALS_JSON: {e}")
+    
+    # Если нет переменной окружения, пробуем файл (для локальной разработки)
+    try:
+        return Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки credentials.json: {e}")
+        raise Exception("Не удалось загрузить Google credentials")
+
+# Инициализация Google Sheets
+try:
+    creds = get_google_credentials()
+    gc = gspread.authorize(creds)
+    finance_sheet = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_NAME)
+    logger.info("Google Sheets подключение успешно установлено")
+except Exception as e:
+    logger.error(f"Ошибка подключения к Google Sheets: {e}")
+    # Создаем заглушку для тестирования
+    finance_sheet = None
 
 # Хранилище последних операций и контекста
 USER_LAST_OPERATIONS = {}
@@ -53,8 +82,17 @@ USER_CONTEXT = {}
 ALLOWED_USERNAME = 'antigorevich'
 
 def is_allowed_user(update: Update):
+    """Проверяет, разрешен ли пользователь"""
     user = update.effective_user
     return user and user.username and user.username.lower() == ALLOWED_USERNAME
+
+def get_message_from_update(update: Update):
+    """Безопасно получает message объект из update"""
+    if update.message:
+        return update.message
+    elif update.callback_query and update.callback_query.message:
+        return update.callback_query.message
+    return None
 
 def analyze_message_with_ai(text, user_context=None):
     """Анализирует сообщение с помощью ИИ с учетом контекста"""
@@ -184,6 +222,10 @@ def update_user_context(user_id, operation_data):
 
 def add_finance_record(data, user_id):
     """Добавляет финансовую запись в таблицу"""
+    if finance_sheet is None:
+        logger.error("Google Sheets недоступен")
+        return False
+        
     try:
         row = [
             format_moscow_date(),  # Московское время
@@ -195,11 +237,15 @@ def add_finance_record(data, user_id):
         ]
         finance_sheet.append_row(row)
 
+        # Получаем актуальное количество строк для правильного индекса
+        all_values = finance_sheet.get_all_values()
+        row_index = len(all_values)
+
         # Сохраняем последнюю операцию
         USER_LAST_OPERATIONS[user_id] = {
             'type': 'finance',
             'data': data,
-            'row': len(finance_sheet.get_all_values()),
+            'row': row_index,
             'timestamp': get_moscow_time()
         }
 
@@ -406,7 +452,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
     params = extract_params_from_voice(params_text, command)
 
     # Получаем message объект
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     if command == "analytics":
         await show_analytics(update, context)
@@ -624,10 +670,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_context_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает историю с контекстом"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     user_id = update.effective_user.id
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     try:
         await message.reply_text("📊 Получаю историю с контекстом...")
@@ -662,11 +716,19 @@ async def show_context_history(update: Update, context: ContextTypes.DEFAULT_TYP
 async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Умная аналитика трат"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     try:
         # Получаем message объект правильно
-        message = update.message if update.message else update.callback_query.message
+        message = get_message_from_update(update)
 
         await message.reply_text("📊 Анализирую ваши финансы...")
 
@@ -745,10 +807,18 @@ async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def description_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Анализ трат по описанию (кому больше всего платите)"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     args = context.args
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     try:
         await message.reply_text("👥 Анализирую траты по получателям...")
@@ -874,10 +944,18 @@ async def description_analysis(update: Update, context: ContextTypes.DEFAULT_TYP
 async def advanced_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Продвинутый поиск операций"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     args = context.args
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     if not args:
         help_text = """
@@ -1122,10 +1200,18 @@ def matches_filters(record, filters):
 async def category_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Анализ по категориям"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     args = context.args
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     try:
         await message.reply_text("📊 Анализирую категории...")
@@ -1198,10 +1284,18 @@ async def category_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def supplier_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Анализ поставщиков"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     args = context.args
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     if not args:
         await message.reply_text("🏭 Использование: /suppliers [название]\nПример: /suppliers Интигам")
@@ -1263,10 +1357,18 @@ async def supplier_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def find_operations(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск операций"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     args = context.args
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     if not args:
         await message.reply_text("🔍 Использование: /find [имя или ключевое слово]\nПример: /find Петров")
@@ -1313,7 +1415,9 @@ async def find_operations(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает главное меню с кнопками"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
     menu_text = """
 🎛️ **Главное меню финансового бота**
@@ -1330,7 +1434,9 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает меню аналитики"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
     keyboard = [
         [
@@ -1356,10 +1462,18 @@ async def show_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def delete_last_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет последнюю операцию"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
     user_id = update.effective_user.id
-    message = update.message if update.message else update.callback_query.message
+    message = get_message_from_update(update)
 
     if user_id not in USER_LAST_OPERATIONS:
         await message.reply_text("❌ Нет операций для удаления.")
@@ -1374,7 +1488,7 @@ async def delete_last_operation(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text("❌ Можно удалить только операции за последний час.")
             return
 
-        # Удаляем строку из таблицы
+        # Удаляем строку из таблицы (индекс строки в gspread начинается с 1)
         finance_sheet.delete_rows(last_op['row'])
         op_info = f"💰 {last_op['data']['description']}: {last_op['data']['amount']:,.0f} ₽"
 
@@ -1390,9 +1504,17 @@ async def delete_last_operation(update: Update, context: ContextTypes.DEFAULT_TY
 async def create_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Создает резервную копию данных"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
-    message = update.message if update.message else update.callback_query.message
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
+    message = get_message_from_update(update)
 
     try:
         await message.reply_text("💾 Создаю резервную копию...")
@@ -1430,9 +1552,17 @@ async def create_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Очищает все данные из таблиц"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
-    message = update.message if update.message else update.callback_query.message
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
+    message = get_message_from_update(update)
 
     try:
         # Очищаем финансовые данные (оставляем только заголовки)
@@ -1465,9 +1595,17 @@ async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пересоздает структуру таблиц"""
     if not is_allowed_user(update):
-        await update.message.reply_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
-    message = update.message if update.message else update.callback_query.message
+    
+    if finance_sheet is None:
+        message = get_message_from_update(update)
+        await message.reply_text("❌ Google Sheets недоступен. Проверьте настройки.")
+        return
+        
+    message = get_message_from_update(update)
 
     try:
         # Пересоздаем заголовки на всякий случай
@@ -1483,11 +1621,9 @@ async def reset_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
     if update and not is_allowed_user(update):
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text('Нет доступа')
-        elif hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text('Нет доступа')
+        message = get_message_from_update(update)
+        if message:
+            await message.reply_text('Нет доступа')
         return
     logger.error(f"Ошибка: {context.error}")
 
